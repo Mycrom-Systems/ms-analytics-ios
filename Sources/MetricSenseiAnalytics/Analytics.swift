@@ -28,10 +28,14 @@ public final class Analytics {
     private let sessionTimeout: TimeInterval = 30 * 60
 
     /// Start sending. `host` is for testing environments (e.g. https://analytics.api.dev.metricsensei.com).
+    /// Safe to call more than once: the latest site ID and host are used and one send timer runs.
     public func configure(siteId: String, host: String = "https://analytics.api.metricsensei.com") {
         queue.sync {
             self.siteId = siteId
             if let url = URL(string: host + "/v1/app") { self.endpoint = url }
+            // Called again (a new site ID, a test host): stop the earlier timer, or each call would leave one
+            // more running for the life of the app.
+            self.timer?.cancel()
             let t = DispatchSource.makeTimerSource(queue: queue)
             t.schedule(deadline: .now() + 10, repeating: 10)
             t.setEventHandler { [weak self] in self?.flushLocked() }
