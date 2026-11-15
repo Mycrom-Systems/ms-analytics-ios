@@ -13,7 +13,7 @@
 // sooner once 20 are waiting, and when the app goes to the background. When the phone is offline, or the service
 // is busy (5xx, 429), the batch goes back on the queue and the next try waits longer (10 s doubling to 5 min). The
 // queue is also kept in a file in the app's caches folder, so events survive the app being closed. Events more
-// than an hour old are dropped when sent, because the service dates an event at most an hour back.
+// than a day old are dropped when sent, because the service dates an app event at most 24 hours back.
 //
 // When the SDK itself fails (a batch it can't encode, or one the service refuses), it tells Metric Sensei so the
 // problem can be fixed: at most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the
@@ -34,8 +34,9 @@ public final class Analytics: @unchecked Sendable {
     static let maxQueued = 1000
     /// The most events in one batch (the service reads at most 50).
     static let maxBatch = 50
-    /// An event older than this when it is sent is dropped: the service dates events at most an hour back.
-    static let maxAge: TimeInterval = 3500
+    /// An event older than this when it is sent is dropped: the service dates app events at most 24 hours back
+    /// (ms-analytics events.APP_MAX_OFFSET_MS); a little under, for clock drift and the time the request takes.
+    static let maxAge: TimeInterval = 86_000
     /// The longest wait between tries while the service can't be reached.
     static let maxBackoff: TimeInterval = 300
 
