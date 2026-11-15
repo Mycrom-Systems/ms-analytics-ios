@@ -255,7 +255,7 @@ public final class Analytics: @unchecked Sendable {
         }
         let body: [String: Any] = [
             "v": 1, "site": siteId, "app": appId, "b": b, "sid": sid, "vid": vid, "ev": ev,
-            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.3.0",
+            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.4.0",
         ]
         guard JSONSerialization.isValidJSONObject(body), let data = try? JSONSerialization.data(withJSONObject: body)
         else {
@@ -407,7 +407,7 @@ public final class Analytics: @unchecked Sendable {
         reportsLeft -= 1
         let v = ProcessInfo.processInfo.operatingSystemVersion
         let body: [String: Any] = [
-            "v": 1, "src": "ios", "sv": "1.3.0", "where": step, "name": name, "msg": message, "site": siteId,
+            "v": 1, "src": "ios", "sv": "1.4.0", "where": step, "name": name, "msg": message, "site": siteId,
             "os": "iOS \(v.majorVersion).\(v.minorVersion)",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }

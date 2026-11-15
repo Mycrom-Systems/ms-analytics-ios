@@ -34,7 +34,8 @@ If the SDK itself fails (the service refuses a batch), it sends Metric Sensei a 
 can fix it: at most 3 an app run, with the SDK version, the step, the error and the OS version. Never the visitor
 ID, events or anything about the person; being offline is never reported.
 
-iOS 14+ / macOS 11+. MIT license.
+iOS 15+ / macOS 12+ (current Xcode builds nothing older). Apps that still target iOS 14 can stay on 1.3.x. MIT
+license.
 
 ## Developing
 `swift build && swift test` (on a Mac; the tests use a fake network). The version is the `"sv"` string in

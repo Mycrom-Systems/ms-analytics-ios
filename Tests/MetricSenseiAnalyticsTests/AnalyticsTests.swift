@@ -125,7 +125,7 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(batches.count, 1)
         let body = batches[0]
         XCTAssertEqual(body["site"] as? String, "MS-TEST0001")
-        XCTAssertEqual(body["sv"] as? String, "1.3.0")
+        XCTAssertEqual(body["sv"] as? String, "1.4.0")
         XCTAssertEqual((body["b"] as? String)?.count, 32)
         XCTAssertEqual((body["sid"] as? String)?.count, 32)
         XCTAssertEqual(body["vid"] as? String, a.visitorId)
