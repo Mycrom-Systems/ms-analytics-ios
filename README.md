@@ -20,8 +20,10 @@ Analytics.shared.track("Purchase", props: ["plan": "pro"], revenue: 49.9, curren
 
 Delivery: events are sent in batches every 10 seconds, sooner once 20 are waiting, and automatically when the app
 goes to the background (`flush()` sends at once if you want to). When the phone is offline or the service is busy,
-events wait (up to 1,000, in a file in the app's caches folder so they survive the app closing) and the SDK tries
-again, waiting longer each time (up to 5 minutes). Events more than a day old are dropped.
+events wait (up to 1,000, in a file in the app's caches folder so they survive the app closing; iOS may clear that
+folder when the phone is short of space) and the SDK tries again, waiting longer each time (up to 5 minutes).
+Every try of a batch is the same batch (its batch ID and each event's ID stay the same), so the service counts it
+once even when an earlier try's answer was lost. Events more than a day old are dropped.
 
 Privacy: no advertising ID, device ID or personal data is read. The visitor ID is random and kept in the app's
 UserDefaults; `reset()` forgets it (e.g. on sign-out). The package includes its privacy manifest

@@ -11,9 +11,12 @@
 //
 // Delivery: events wait in a queue (at most 1,000; the oldest go first past that) and are sent every 10 seconds,
 // sooner once 20 are waiting, and when the app goes to the background. When the phone is offline, or the service
-// is busy (5xx, 429), the batch goes back on the queue and the next try waits longer (10 s doubling to 5 min). The
-// queue is also kept in a file in the app's caches folder, so events survive the app being closed. Events more
-// than a day old are dropped when sent, because the service dates an app event at most 24 hours back.
+// is busy (5xx, 429, 409 "still working on it"), the batch is kept and the next try waits longer (10 s doubling to
+// 5 min). A batch is frozen the first time it is sent: it keeps its batch ID ("b") and its events (each with its
+// own "id") on every retry, so the service can count it once even when its answer was lost. The queue is also
+// kept in a file in the app's caches folder, so events survive the app being closed (iOS may clear that folder
+// when the phone is short of space). Events more than a day old are dropped when sent, because the service dates
+// an app event at most 24 hours back.
 //
 // When the SDK itself fails (a batch it can't encode, or one the service refuses), it tells Metric Sensei so the
 // problem can be fixed: at most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the
@@ -52,8 +55,12 @@ public final class Analytics: @unchecked Sendable {
     private var errorsEndpoint = URL(string: "https://analytics.api.metricsensei.com/v1/errors")!
     private var reportsLeft = 3
     /// Waiting events. Each keeps its own session (`sid`), visitor (`vid`) and clock (`at`) so a batch sent
-    /// later, or after a restart, still names the session it happened in. Those three are taken out when sent.
+    /// later, or after a restart, still names the session it happened in. Those three are taken out when sent;
+    /// its `id` (16 hex) is sent, so the service can tell a resent event from a new one.
     private var events: [[String: Any]] = []
+    /// The batch being sent or waiting to be tried again: `b` (32 hex), `sid`, `vid` and its `events`. It never
+    /// changes once made (only events past `maxAge` fall out), so every try is the same batch to the service.
+    private var pending: [String: Any]?
     private var session = ""
     private var lastActivity = Date.distantPast
     private var screenCount = 0
@@ -144,8 +151,13 @@ public final class Analytics: @unchecked Sendable {
         return v
     }
 
-    /// For tests: how many events are waiting.
-    var queuedCount: Int { queue.sync { events.count } }
+    /// For tests: how many events are waiting, the pending batch's included.
+    var queuedCount: Int { queue.sync { events.count + ((pending?["events"] as? [[String: Any]])?.count ?? 0) } }
+
+    /// Random lowercase hex, `bytes` * 2 characters long (batch and event IDs).
+    static func randomHex(bytes: Int) -> String {
+        (0..<bytes).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+    }
 
     /// For tests: runs `body` on the SDK's queue once nothing is being sent.
     func whenIdle(_ body: @escaping () -> Void) {
@@ -170,6 +182,7 @@ public final class Analytics: @unchecked Sendable {
         e["sid"] = session
         e["vid"] = visitorId
         e["at"] = Date().timeIntervalSince1970
+        e["id"] = Self.randomHex(bytes: 8)
         events.append(e)
         trimLocked()
         if events.count >= 20 { flushLocked(force: false) }
@@ -197,28 +210,41 @@ public final class Analytics: @unchecked Sendable {
         timer = nil
     }
 
-    /// Sends the next batch: up to 50 events of one session and visitor, oldest first. Waits while another batch
-    /// is on its way, and (unless `force`) while a failed send's backoff runs. Old events are dropped here.
+    /// Sends the pending batch, or freezes the next one (up to 50 events of one session and visitor, oldest
+    /// first) as the pending batch and sends that. Waits while a batch is on its way, and (unless `force`) while a
+    /// failed send's backoff runs. Old events are dropped here. The pending batch is saved before it is sent, so a
+    /// batch whose answer never came is sent again (the same batch: the service counts it once).
     private func flushLocked(force: Bool) {
         guard !sending, !siteId.isEmpty, force || Date() >= retryAt else { return }
         let now = Date().timeIntervalSince1970
-        events.removeAll { now - (($0["at"] as? Double) ?? now) > Self.maxAge }
-        guard let first = events.first else {
-            saveLocked()
-            return
+        let fresh: ([String: Any]) -> Bool = { now - (($0["at"] as? Double) ?? now) <= Self.maxAge }
+        events = events.filter(fresh)
+        if var p = pending {
+            let kept = ((p["events"] as? [[String: Any]]) ?? []).filter(fresh)
+            p["events"] = kept
+            pending = kept.isEmpty ? nil : p
         }
-        let sid = (first["sid"] as? String) ?? session
-        let vid = (first["vid"] as? String) ?? visitorId
-        var count = 0
-        while count < min(events.count, Self.maxBatch),
-              ((events[count]["sid"] as? String) ?? sid) == sid, ((events[count]["vid"] as? String) ?? vid) == vid {
-            count += 1
+        if pending == nil, let first = events.first {
+            let sid = (first["sid"] as? String) ?? session
+            let vid = (first["vid"] as? String) ?? visitorId
+            var count = 0
+            while count < min(events.count, Self.maxBatch),
+                  ((events[count]["sid"] as? String) ?? sid) == sid, ((events[count]["vid"] as? String) ?? vid) == vid {
+                count += 1
+            }
+            // Built by subscript, not a literal: these keys are the queue file's, never sent.
+            var p = [String: Any]()
+            p["b"] = Self.randomHex(bytes: 16)
+            p["sid"] = sid
+            p["vid"] = vid
+            p["events"] = Array(events.prefix(count))
+            events.removeFirst(count)
+            pending = p
         }
-        let batch = Array(events.prefix(count))
-        events.removeFirst(count)
-        // The file no longer holds this batch: if the app is killed before the answer comes, the batch is lost
-        // rather than sent twice on the next start (a purchase counted twice is worse than one missed).
         saveLocked()
+        guard let p = pending, let batch = p["events"] as? [[String: Any]], let b = p["b"] as? String,
+              let sid = p["sid"] as? String, let vid = p["vid"] as? String
+        else { return }
         let ev = batch.map { e -> [String: Any] in
             var x = e
             let at = (x.removeValue(forKey: "at") as? Double) ?? now
@@ -228,12 +254,13 @@ public final class Analytics: @unchecked Sendable {
             return x
         }
         let body: [String: Any] = [
-            "v": 1, "site": siteId, "app": appId, "sid": sid, "vid": vid, "ev": ev,
-            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.2.0",
+            "v": 1, "site": siteId, "app": appId, "b": b, "sid": sid, "vid": vid, "ev": ev,
+            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.3.0",
         ]
         guard JSONSerialization.isValidJSONObject(body), let data = try? JSONSerialization.data(withJSONObject: body)
         else {
             reportLocked(step: "flush", name: "encode", message: "A batch of \(batch.count) events could not be encoded")
+            pending = nil
             saveLocked()
             return
         }
@@ -245,31 +272,31 @@ public final class Analytics: @unchecked Sendable {
         urlSession.dataTask(with: req) { [weak self] _, response, _ in
             guard let self else { return }
             let http = response as? HTTPURLResponse
-            self.queue.async { self.finishLocked(batch: batch, code: http?.statusCode, retryAfter: http) }
+            self.queue.async { self.finishLocked(code: http?.statusCode, retryAfter: http) }
         }.resume()
     }
 
-    /// Handles a batch's answer. No answer (offline), 5xx or 429: the batch goes back to the front of the queue
-    /// and the next try waits longer. Any other 4xx: the batch is dropped and reported. Success: the next batch
-    /// goes at once if more are waiting.
-    private func finishLocked(batch: [[String: Any]], code: Int?, retryAfter http: HTTPURLResponse?) {
+    /// Handles the pending batch's answer. No answer (offline), 5xx, 429 or 409 (the service is still handling
+    /// this batch from an earlier try): the batch stays pending and the next try waits longer. Any other 4xx: the
+    /// batch is dropped and reported. Success (also "duplicate": the service already has it): the batch is done
+    /// and the next one goes at once if more are waiting.
+    private func finishLocked(code: Int?, retryAfter http: HTTPURLResponse?) {
         sending = false
-        let retry = code == nil || code! >= 500 || code! == 429
+        let retry = code.map { $0 >= 500 || $0 == 429 || $0 == 409 } ?? true
         if retry {
-            events.insert(contentsOf: batch, at: 0)
-            trimLocked()
             backoff = min(max(backoff * 2, 10), Self.maxBackoff)
-            // A 429 or 503 may say how long to wait (in seconds); never more than our own longest wait.
+            // A 429, 409 or 503 may say how long to wait (in seconds); never more than our own longest wait.
             if let s = http?.value(forHTTPHeaderField: "Retry-After"), let wait = TimeInterval(s), wait > backoff {
                 backoff = min(wait, Self.maxBackoff)
             }
             retryAt = Date().addingTimeInterval(backoff)
         } else {
+            pending = nil
             backoff = 0
             retryAt = .distantPast
         }
-        // A refusal is a failure of ours worth knowing about; being offline is not.
-        if let code, code >= 400, code != 429 {
+        // A refusal is a failure of ours worth knowing about; being offline, "slow down" and "still working" are not.
+        if let code, code >= 400, code != 429, code != 409 {
             reportLocked(step: "flush", name: "http_\(code)", message: "The service refused a batch with HTTP \(code)")
         }
         saveLocked()
@@ -282,16 +309,20 @@ public final class Analytics: @unchecked Sendable {
         }
     }
 
-    /// Writes the waiting events to the queue file (removes it when there are none). Best effort: a write that
-    /// fails only means those events aren't kept across a restart.
+    /// Writes the pending batch and the waiting events to the queue file as `{"pending": ..., "events": [...]}`
+    /// (removes it when there is nothing). Best effort: a write that fails only means those events aren't kept
+    /// across a restart.
     private func saveLocked() {
         guard let url = storeURL else { return }
-        if events.isEmpty {
+        if events.isEmpty && pending == nil {
             try? FileManager.default.removeItem(at: url)
             return
         }
-        guard JSONSerialization.isValidJSONObject(events),
-              let data = try? JSONSerialization.data(withJSONObject: events)
+        // Built by subscript, not a literal: these keys are the file's, never sent.
+        var doc = [String: Any]()
+        doc["events"] = events
+        if let p = pending { doc["pending"] = p }
+        guard JSONSerialization.isValidJSONObject(doc), let data = try? JSONSerialization.data(withJSONObject: doc)
         else {
             // Never leave an older copy behind: it would be sent again on the next start.
             try? FileManager.default.removeItem(at: url)
@@ -301,13 +332,29 @@ public final class Analytics: @unchecked Sendable {
         try? data.write(to: url, options: .atomic)
     }
 
-    /// Puts events saved by an earlier run ahead of this run's, once per app run (on the first configure()).
+    /// Puts what an earlier run saved ahead of this run's events, once per app run (on the first configure()).
+    /// Reads both the 1.3 file (`{"pending", "events"}`) and 1.2's plain list of events (no batch or event IDs:
+    /// they are queued like new ones).
     private func loadStoreLocked() {
         guard !loadedStore, let url = storeURL else { return }
         loadedStore = true
-        guard let data = try? Data(contentsOf: url),
-              let saved = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
-        events.insert(contentsOf: saved.filter { $0["t"] is String && $0["sid"] is String }, at: 0)
+        guard let data = try? Data(contentsOf: url), let json = try? JSONSerialization.jsonObject(with: data) else {
+            return
+        }
+        let valid: ([String: Any]) -> Bool = { $0["t"] is String && $0["sid"] is String }
+        var saved: [[String: Any]] = []
+        if let list = json as? [[String: Any]] {
+            saved = list
+        } else if let doc = json as? [String: Any] {
+            saved = (doc["events"] as? [[String: Any]]) ?? []
+            if pending == nil, var p = doc["pending"] as? [String: Any], p["b"] is String, p["sid"] is String,
+               p["vid"] is String {
+                let members = ((p["events"] as? [[String: Any]]) ?? []).filter(valid)
+                p["events"] = members
+                if !members.isEmpty { pending = p }
+            }
+        }
+        events.insert(contentsOf: saved.filter(valid), at: 0)
         trimLocked()
     }
 
@@ -360,7 +407,7 @@ public final class Analytics: @unchecked Sendable {
         reportsLeft -= 1
         let v = ProcessInfo.processInfo.operatingSystemVersion
         let body: [String: Any] = [
-            "v": 1, "src": "ios", "sv": "1.2.0", "where": step, "name": name, "msg": message, "site": siteId,
+            "v": 1, "src": "ios", "sv": "1.3.0", "where": step, "name": name, "msg": message, "site": siteId,
             "os": "iOS \(v.majorVersion).\(v.minorVersion)",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }

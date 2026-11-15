@@ -125,7 +125,8 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertEqual(batches.count, 1)
         let body = batches[0]
         XCTAssertEqual(body["site"] as? String, "MS-TEST0001")
-        XCTAssertEqual(body["sv"] as? String, "1.2.0")
+        XCTAssertEqual(body["sv"] as? String, "1.3.0")
+        XCTAssertEqual((body["b"] as? String)?.count, 32)
         XCTAssertEqual((body["sid"] as? String)?.count, 32)
         XCTAssertEqual(body["vid"] as? String, a.visitorId)
         let ev = body["ev"] as? [[String: Any]] ?? []
@@ -140,6 +141,7 @@ final class AnalyticsTests: XCTestCase {
         XCTAssertNil(pr["ok"], "only strings, true/false and numbers are sent")
         for e in ev {
             XCTAssertNotNil(e["o"])
+            XCTAssertEqual((e["id"] as? String)?.count, 16)
             XCTAssertNil(e["at"]); XCTAssertNil(e["sid"]); XCTAssertNil(e["vid"])
         }
         XCTAssertEqual(a.queuedCount, 0)
@@ -216,5 +218,82 @@ final class AnalyticsTests: XCTestCase {
         for i in 0..<(Analytics.maxQueued + 50) { a.track("e\(i)") }
         XCTAssertEqual(a.queuedCount, Analytics.maxQueued)
         XCTAssertTrue(StubProtocol.bodies("/v1/app").isEmpty)
+    }
+
+    /// A retry is the same batch: same "b", same events with the same "id"s, even when more events were tracked
+    /// in between (they go in the next batch).
+    func testRetryResendsTheSameFrozenBatch() {
+        StubProtocol.reset(status: nil)
+        let a = makeSDK()
+        a.configure(siteId: "MS-TEST0001", host: "https://example.test")
+        a.screen("Home")
+        flushAndWait(a)
+        let tried = StubProtocol.bodies("/v1/app")
+        XCTAssertEqual(tried.count, 1)
+
+        a.screen("Next")
+        StubProtocol.reset(status: 202)
+        flushAndWait(a)
+        let sent = StubProtocol.bodies("/v1/app")
+        XCTAssertEqual(sent.count, 2, "the frozen batch, then the new event in a batch of its own")
+        XCTAssertEqual(sent[0]["b"] as? String, tried[0]["b"] as? String)
+        let ids = { (body: [String: Any]) in ((body["ev"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String } }
+        XCTAssertEqual(ids(sent[0]), ids(tried[0]))
+        XCTAssertEqual(ids(sent[0]).count, 1)
+        XCTAssertNotEqual(sent[1]["b"] as? String, sent[0]["b"] as? String)
+        XCTAssertEqual(a.queuedCount, 0)
+    }
+
+    /// 409 (the service is still handling an earlier try) keeps the batch and isn't reported; a 202 "duplicate"
+    /// answer finishes it.
+    func testInProgressIsRetriedAndDuplicateFinishes() {
+        StubProtocol.reset(status: 409)
+        let a = makeSDK()
+        a.configure(siteId: "MS-TEST0001", host: "https://example.test")
+        a.screen("Home")
+        flushAndWait(a)
+        XCTAssertEqual(a.queuedCount, 1)
+
+        StubProtocol.reset(status: 202)
+        flushAndWait(a)
+        XCTAssertEqual(a.queuedCount, 0)
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertTrue(StubProtocol.bodies("/v1/errors").isEmpty, "409 is not a failure")
+    }
+
+    /// A batch whose answer never came is sent again after a restart with the same "b".
+    func testPendingBatchSurvivesRestartWithItsId() {
+        StubProtocol.reset(status: nil)
+        let first = makeSDK()
+        first.configure(siteId: "MS-TEST0001", host: "https://example.test")
+        first.screen("Home")
+        flushAndWait(first)
+        let b = StubProtocol.bodies("/v1/app").first?["b"] as? String
+        XCTAssertNotNil(b)
+
+        StubProtocol.reset(status: 202)
+        let second = makeSDK()
+        second.configure(siteId: "MS-TEST0001", host: "https://example.test")
+        flushAndWait(second)
+        XCTAssertEqual(StubProtocol.bodies("/v1/app").first?["b"] as? String, b)
+        XCTAssertEqual(second.queuedCount, 0)
+    }
+
+    /// SDK 1.2.0 saved a plain list of events; an upgraded app still sends them (in a new batch).
+    func testLoadsAVersion12QueueFile() throws {
+        let old: [[String: Any]] = [[
+            "t": "pv", "p": "/Old", "n": 1, "sid": String(repeating: "a", count: 32),
+            "vid": String(repeating: "b", count: 32), "at": Date().timeIntervalSince1970 - 60,
+        ]]
+        try FileManager.default.createDirectory(at: store.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: old).write(to: store)
+        let a = makeSDK()
+        a.configure(siteId: "MS-TEST0001", host: "https://example.test")
+        XCTAssertEqual(a.queuedCount, 1)
+        flushAndWait(a)
+        let body = StubProtocol.bodies("/v1/app").first ?? [:]
+        XCTAssertEqual(body["sid"] as? String, String(repeating: "a", count: 32))
+        XCTAssertEqual((body["b"] as? String)?.count, 32)
+        XCTAssertEqual(((body["ev"] as? [[String: Any]])?.first?["p"]) as? String, "/Old")
     }
 }
