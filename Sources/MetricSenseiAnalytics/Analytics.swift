@@ -8,6 +8,11 @@
 //
 // No advertising ID, device ID or personal data is read. The visitor ID is random, kept in this app's
 // UserDefaults; call reset() when someone signs out if you don't want their next session joined to the last.
+//
+// When the SDK itself fails (a batch it can't encode, or one the service refuses), it tells Metric Sensei so the
+// problem can be fixed: at most 3 short reports an app run to /v1/errors, holding the SDK's version, the step, the
+// error and the iOS version. Never the visitor ID, events or anything about the person. Being offline isn't a
+// failure and is never reported.
 
 import Foundation
 
@@ -18,6 +23,8 @@ public final class Analytics {
     private var siteId = ""
     private var appId = Bundle.main.bundleIdentifier ?? ""
     private var endpoint = URL(string: "https://analytics.api.metricsensei.com/v1/app")!
+    private var errorsEndpoint = URL(string: "https://analytics.api.metricsensei.com/v1/errors")!
+    private var reportsLeft = 3
     private var events: [[String: Any]] = []
     private var session = ""
     private var lastActivity = Date.distantPast
@@ -33,6 +40,7 @@ public final class Analytics {
         queue.sync {
             self.siteId = siteId
             if let url = URL(string: host + "/v1/app") { self.endpoint = url }
+            if let url = URL(string: host + "/v1/errors") { self.errorsEndpoint = url }
             // Called again (a new site ID, a test host): stop the earlier timer, or each call would leave one
             // more running for the life of the app.
             self.timer?.cancel()
@@ -111,10 +119,37 @@ public final class Analytics {
         }
         let body: [String: Any] = [
             "v": 1, "site": siteId, "app": appId, "sid": session, "vid": visitorId, "ev": ev,
-            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.0.0",
+            "os": "iOS", "lang": Locale.preferredLanguages.first ?? "", "sv": "1.1.0",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+            reportLocked(step: "flush", name: "encode", message: "A batch of \(batch.count) events could not be encoded")
+            return
+        }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = data
+        URLSession.shared.dataTask(with: req) { [weak self] _, response, _ in
+            // No answer at all means offline: not a failure. A refusal (other than "slow down") is one.
+            guard let code = (response as? HTTPURLResponse)?.statusCode, code >= 400, code != 429 else { return }
+            self?.queue.async {
+                self?.reportLocked(step: "flush", name: "http_\(code)", message: "The service refused a batch with HTTP \(code)")
+            }
+        }.resume()
+    }
+
+    /// Reports a failure of this SDK itself to the platform's failures dataset (POST /v1/errors, read by
+    /// ms_core.failures.client_report): at most 3 an app run, nothing about the person or their events.
+    private func reportLocked(step: String, name: String, message: String) {
+        guard reportsLeft > 0 else { return }
+        reportsLeft -= 1
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        let body: [String: Any] = [
+            "v": 1, "src": "ios", "sv": "1.1.0", "where": step, "name": name, "msg": message, "site": siteId,
+            "os": "iOS \(v.majorVersion).\(v.minorVersion)",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var req = URLRequest(url: endpoint)
+        var req = URLRequest(url: errorsEndpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = data
